@@ -61,11 +61,11 @@ unsigned int _mbctoupper(unsigned int c) {
 }
 #endif
 
-/* Default input buffer size */
-#define IBUFSIZ 2048
+/* Input buffer size. */
+#define IBUFSIZ 4096  /* IBUFSIZ. Arbitrary size, just for speed. */
 
-/* Default output buffer size */
-#define OBUFSIZ 2048
+/* Output buffer size. */
+#define OBUFSIZ 4096  /* OBUFSIZ. Arbitrary size, just for speed. */
 
 /* Defines for third byte of header */
 #define BIT_MASK        0x1f    /* Mask for 'number of compresssion bits'       */
@@ -83,20 +83,14 @@ unsigned int _mbctoupper(unsigned int c) {
 
 
 /* machine variants which require cc -Dmachine:  pdp11, z8000, DOS */
-#define HBITS      17   /* 50% occupancy */
-#define HSIZE      (1<<HBITS)
-#define HMASK      (HSIZE-1)    /* unused */
-#define HPRIME     9941         /* unused */
 #define BITS       16
 #undef  MAXSEG_64K              /* unused */
 #define MAXCODE(n) (1L << (n))
 
-#define htabof(i)               htab[i]
-#define codetabof(i)            codetab[i]
-#define tab_prefixof(i)         codetabof(i)
-#define tab_suffixof(i)         ((unsigned char *)(htab))[i]
-#define de_stack                ((unsigned char *)&(htab[HSIZE-1]))
-#define clear_tab_prefixof()    memset(codetab, 0, 256)
+#define lzw_stackof(i)          lzw_stack[i]
+#define tab_prefixof(i)         (tab_prefix_ary - 256)[i]  /* Minimum valid index is 256. */
+#define tab_suffixof(i)         (tab_suffix_ary - 256)[i]  /* Minimum valid index is 256. */
+#define de_stack                (lzw_stack + sizeof(lzw_stack))
 
 ssize_t full_write(int fd, const void *buf, size_t count) {
 	const char *buf0 = (const char*)buf;
@@ -118,11 +112,18 @@ void error_msg(const char *msg) {
 #  define ERROR_MSG(msg) error_msg(msg "\n")
 #endif
 
-/* 399424 bytes in total in these buffers. */
-unsigned char inbuf[IBUFSIZ + 64];  /* wasn't zeroed out before, maybe can xmalloc? */
-unsigned char outbuf[OBUFSIZ + 2048];
-unsigned char htab[HSIZE];
-unsigned short codetab[HSIZE];
+/* 269330 bytes in total in these buffers. Most of them are necessary. We
+ * could make it work without lzw_stack (and increasing outbuf to 32 KiB),
+ * but that would make decompression about 1.77 times slower.
+ */
+/* +BITS is here for disk-block-aligned read(2)s of size IBUFSIZ.
+ * +(sizeof(long) - 2) is because of the overshoot when reading code bits.
+ */
+unsigned char inbuf[IBUFSIZ + BITS + (sizeof(long) - 2)];  /* wasn't zeroed out before, maybe can xmalloc? */
+unsigned char outbuf[OBUFSIZ];
+unsigned char lzw_stack[((1UL << 16) - 254U)];  /* This is the minimum size needed to decompress very long runs of the same byte. */
+unsigned char  tab_suffix_ary[(1UL << 16) - 256U];
+unsigned short tab_prefix_ary[(1UL << 16) - 256U];
 
 /*
  * Decompress stdin to stdout.  This routine adapts to the codes in the
@@ -191,16 +192,13 @@ int main(int argc, char **argv) {
 	free_ent = ((block_mode) ? FIRST : 256);
 
 	/* As above, initialize the first 256 entries in the table. */
-	/*clear_tab_prefixof(); - .bss is automatically zero-initialized */
-
-	for (i = 255; i >= 0; --i)
-		tab_suffixof(i) = (unsigned char) i;
 
 	do {
  resetbuf:
 		{
 			o = posbits >> 3;
 			e = insize - o;
+			if (e < 0) e = 0;
 
 			for (i = 0; i < e; ++i)
 				inbuf[i] = inbuf[i + o];
@@ -209,7 +207,7 @@ int main(int argc, char **argv) {
 			posbits = 0;
 		}
 
-		if (insize < (int) (IBUFSIZ + 64) - IBUFSIZ) {
+		if (insize < BITS) {
 			rsize = read(src_fd, inbuf + insize, IBUFSIZ);
 			if (rsize < 0) {
 				ERROR_MSG("read error");
@@ -258,7 +256,6 @@ int main(int argc, char **argv) {
 			}
 
 			if (code == CLEAR && block_mode) {
-				clear_tab_prefixof();
 				free_ent = FIRST - 1;
 				posbits =
 					((posbits - 1) +
@@ -282,12 +279,12 @@ int main(int argc, char **argv) {
 
 			/* Generate output characters in reverse order */
 			while (code >= 256) {
-				if (stackp <= &htabof(0)) goto corrupt;
+				if (stackp <= &lzw_stackof(0)) goto corrupt;
 				*--stackp = tab_suffixof(code);
 				code = tab_prefixof(code);
 			}
 
-			finchar = tab_suffixof(code);
+			finchar = code;
 			*--stackp = (unsigned char) finchar;
 
 			/* And put them out in forward order */
